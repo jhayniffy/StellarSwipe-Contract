@@ -7,20 +7,42 @@ use crate::{
     require_admin, GovernanceError, StorageKey,
 };
 
-// ── #692: Integer square root (Newton's method, no floating-point) ───────────
+// ── #692 / security: Integer square root (Newton's method, no floating-point) ─
+//
+// Vote weight under quadratic voting is `floor(sqrt(staked_balance))`. Token
+// balances are `i128`, and a naive Newton's-method bisection can overflow at
+// the boundary: the classic first guess `(x + 1) / 2` panics/wraps when
+// `x == i128::MAX` (or `u128::MAX`) because `x + 1` overflows. To keep the
+// hot loop entirely overflow-free regardless of magnitude, the core
+// computation is done in `u128` (double the headroom of the `i128` balances
+// it operates on) using `x - x / 2` instead of `(x + 1) / 2` — the two are
+// mathematically equivalent (`ceil(x / 2)`) but the subtraction form can
+// never overflow, even at `u128::MAX`. See the `isqrt_u128` tests below,
+// including a proptest over the full `u128` range, for the overflow-safety
+// argument in executable form.
 
-/// Compute floor(sqrt(n)) using integer arithmetic only.
-pub fn isqrt(n: i128) -> i128 {
-    if n <= 0 {
+/// Bisection square root operating entirely within `u128` so it cannot
+/// overflow for any input, including `u128::MAX`.
+fn isqrt_u128(n: u128) -> u128 {
+    if n == 0 {
         return 0;
     }
     let mut x = n;
-    let mut y = (x + 1) / 2;
+    let mut y = x - x / 2; // ceil(x / 2), overflow-free equivalent of (x + 1) / 2
     while y < x {
         x = y;
         y = (x + n / x) / 2;
     }
     x
+}
+
+/// Compute floor(sqrt(n)) using integer arithmetic only. Balances are
+/// signed (`i128`); negative or zero input has no positive square root.
+pub fn isqrt(n: i128) -> i128 {
+    if n <= 0 {
+        return 0;
+    }
+    isqrt_u128(n as u128) as i128
 }
 
 // ── #693: Proposal Category ──────────────────────────────────────────────────
@@ -1067,5 +1089,89 @@ fn category_to_key(category: &ProposalCategory) -> u32 {
         ProposalCategory::ContractUpgrade => 1,
         ProposalCategory::TreasuryTransfer => 2,
         ProposalCategory::General => 3,
+    }
+}
+
+// ── isqrt overflow-safety tests ───────────────────────────────────────────────
+
+#[cfg(test)]
+mod isqrt_tests {
+    use super::{isqrt, isqrt_u128};
+
+    #[test]
+    fn isqrt_u128_max_does_not_panic_and_is_exact() {
+        // floor(sqrt(2^128 - 1)) == 2^64 - 1
+        assert_eq!(isqrt_u128(u128::MAX), 18_446_744_073_709_551_615u128);
+    }
+
+    #[test]
+    fn isqrt_u128_zero_and_small_values() {
+        assert_eq!(isqrt_u128(0), 0);
+        assert_eq!(isqrt_u128(1), 1);
+        assert_eq!(isqrt_u128(2), 1);
+        assert_eq!(isqrt_u128(3), 1);
+        assert_eq!(isqrt_u128(4), 2);
+        assert_eq!(isqrt_u128(99), 9);
+        assert_eq!(isqrt_u128(100), 10);
+    }
+
+    #[test]
+    fn isqrt_i128_boundary_does_not_panic() {
+        // The public, balance-facing API operates on i128 — the whale
+        // scenario from the bug report is a balance approaching i128::MAX.
+        let result = isqrt(i128::MAX);
+        assert!(result > 0);
+        assert!(result.checked_mul(result).unwrap() <= i128::MAX);
+
+        assert_eq!(isqrt(0), 0);
+        assert_eq!(isqrt(-1), 0);
+        assert_eq!(isqrt(i128::MIN), 0);
+    }
+
+    #[test]
+    fn isqrt_matches_known_values() {
+        assert_eq!(isqrt(100), 10);
+        assert_eq!(isqrt(10_000), 100);
+        assert_eq!(isqrt(u64::MAX as i128), 4_294_967_295);
+    }
+}
+
+#[cfg(test)]
+mod isqrt_proptests {
+    use proptest::prelude::*;
+
+    use super::isqrt_u128;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        /// Core invariant from the bug report: isqrt(n)^2 <= n for every n,
+        /// sampled across the full u128 range (including values near
+        /// u128::MAX, where a squaring-based approach would overflow).
+        #[test]
+        fn isqrt_squared_never_exceeds_input(n in any::<u128>()) {
+            let root = isqrt_u128(n);
+            // root <= 2^64 - 1 always, so root * root cannot overflow u128.
+            prop_assert!(root.checked_mul(root).unwrap() <= n);
+        }
+
+        /// isqrt(n) is the *floor* of the true square root: the next integer
+        /// up must overshoot. `next * next` can itself overflow u128 right
+        /// at the boundary (root == 2^64 - 1 => next == 2^64 => next^2 ==
+        /// 2^128), in which case it trivially exceeds n (which fits in u128).
+        #[test]
+        fn isqrt_is_floor_of_true_root(n in any::<u128>()) {
+            let root = isqrt_u128(n);
+            let next = root + 1;
+            match next.checked_mul(next) {
+                Some(next_sq) => prop_assert!(next_sq > n),
+                None => {} // overflowed u128 => certainly > n
+            }
+        }
+
+        #[test]
+        fn isqrt_does_not_panic_near_boundaries(n in (u128::MAX - 1_000_000)..=u128::MAX) {
+            let _ = isqrt_u128(n);
+        }
     }
 }
